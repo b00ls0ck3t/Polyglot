@@ -1,0 +1,32 @@
+# Polyglot Configuration
+
+# Diarization settings
+diarization:
+  method: pyannote  # Options: ecapa, pyannote, none
+  pending_threshold: 0.4  # Similarity threshold for unknown speakers (ECAPA only)
+  min_pending_samples: 5  # Samples needed before promoting to new speaker (ECAPA only)
+
+# Transcription settings
+transcription:
+  model: large-v2  # Options: medium, large-v2, large-v3
+  chunk_duration: 10  # seconds
+
+# Voice Activity Detection
+vad:
+  threshold: 0.5  # 0.0-1.0, higher = more strict
+
+# Translation buffering
+buffering:
+  max_time: 60  # seconds before force flush
+  max_chars: 2000  # characters before force flush
+  silence_flush: 5  # seconds of silence before flush
+
+# API endpoints
+api:
+  deepl_url: "https://api-free.deepl.com/v2/translate"
+  websocket_url: "ws://localhost:8000/ws"
+
+# Audio settings
+audio:
+  sample_rate: 16000
+  channels: 1
