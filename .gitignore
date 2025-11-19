@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+*.key
+
+# Models
+*.bin
+*.gguf
+models/
+whisper.cpp/models/
+
+# Audio
+*.wav
+*.mp3
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
