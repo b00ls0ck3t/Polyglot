@@ -60,7 +60,7 @@ PROFILES = {
 }
 
 # SELECT YOUR PROFILE HERE:
-ACTIVE_PROFILE = "SPEED"  # Change to "ACCURACY" for speaker diarization
+ACTIVE_PROFILE = "ACCURACY"  # Change to "ACCURACY" for speaker diarization
 
 # Load active configuration
 CONFIG = PROFILES[ACTIVE_PROFILE]
