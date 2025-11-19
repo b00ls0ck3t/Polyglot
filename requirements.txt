@@ -1,0 +1,14 @@
+# Translation service
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.1
+websockets==12.0
+
+# Audio processing pipeline
+pyannote.audio==3.1.1
+pyaudio==0.2.14
+numpy==1.24.3
+torch==2.1.0
+torchaudio==2.1.0
+
+# Note: whisper.cpp must be installed separately (compiled from source)
