@@ -3,6 +3,8 @@ ECAPA-TDNN Speaker Diarization Implementation
 Lightweight alternative to pyannote for real-time use
 """
 
+from __future__ import annotations
+
 import numpy as np
 import torch
 from typing import Optional, List, Dict

@@ -56,10 +56,8 @@ def create_diarizer(method: str, config: dict = None) -> DiarizationProtocol:
         )
     
     elif method == "pyannote":
-        # Import the existing pyannote diarizer class
-        # We'll need to extract it from audio_pipeline.py
-        from pyannote_diarizer import PyannnoteDiarizer
-        return PyannnoteDiarizer()
+        from pyannote_diarizer import PyannoteDiarizer
+        return PyannoteDiarizer()
     
     elif method == "none":
         return NoDiarizer()

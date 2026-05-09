@@ -176,10 +176,10 @@ echo "Step 6: Verifying installation"
 echo "=========================================="
 
 echo "Checking whisper.cpp..."
-if [ -f "$WHISPER_DIR/main" ]; then
+if [ -f "$WHISPER_DIR/build/bin/whisper-cli" ] || [ -f "$WHISPER_DIR/main" ]; then
     echo -e "${GREEN}✓ whisper.cpp executable found${NC}"
 else
-    echo -e "${RED}✗ whisper.cpp executable not found${NC}"
+    echo -e "${RED}✗ whisper.cpp executable not found (expected at build/bin/whisper-cli or main)${NC}"
     exit 1
 fi
 

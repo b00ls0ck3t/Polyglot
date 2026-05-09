@@ -628,7 +628,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         pass
     
     except WebSocketDisconnect:
-        manager.clients.remove(websocket)
+        manager.clients.discard(websocket)
 
 
 if __name__ == "__main__":
