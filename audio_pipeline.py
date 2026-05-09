@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Polyglot - Real-Time Speech Translation
-Whisper.cpp -> Pyannote Diarization -> DeepL Translation
+Whisper.cpp -> Diarization -> Translation Service
 """
 
+from __future__ import annotations
+
 import warnings
-# Filter out torchaudio deprecation warnings (can't fix - library issue)
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.core.io")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio._internal.module_utils")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio._backend")
@@ -25,168 +26,105 @@ import tempfile
 import time
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from queue import Queue
 import sys
 
 import numpy as np
 import websockets
-from pyannote.audio import Pipeline
 import pyaudio
 import torch
 
-# ============================================================
-# CONFIGURATION PROFILES
-# ============================================================
-# Switch between profiles by changing ACTIVE_PROFILE
-
-PROFILES = {
-    "SPEED": {
-        "name": "Speed Priority (Real-time capable)",
-        "whisper_model": "medium",
-        "chunk_duration": 4,
-        "enable_diarization": False,
-        "vad_threshold": 0.5,
-        "description": "Fast transcription, no speaker labels, ~5-6s total latency"
-    },
-    "ACCURACY": {
-        "name": "Accuracy Priority (Speaker identification)",
-        "whisper_model": "large-v2", 
-        "chunk_duration": 10,
-        "enable_diarization": True,
-        "vad_threshold": 0.5,
-        "description": "Best quality, speaker labels, ~12-15s total latency"
-    }
-}
-
-# SELECT YOUR PROFILE HERE:
-ACTIVE_PROFILE = "ACCURACY"  # Change to "ACCURACY" for speaker diarization
-
-# Load active configuration
-CONFIG = PROFILES[ACTIVE_PROFILE]
-WHISPER_MODEL = CONFIG["whisper_model"]
-CHUNK_DURATION = CONFIG["chunk_duration"]
-ENABLE_DIARIZATION = CONFIG["enable_diarization"]
-VAD_THRESHOLD = CONFIG["vad_threshold"]
-
-# ============================================================
-
-# Configuration
-SAMPLE_RATE = 16000
-CHANNELS = 1
-WEBSOCKET_URL = "ws://localhost:8000/ws"
-
-# Speaker-aware translation batching
-MAX_BUFFER_TIME = 60  # seconds - max time to hold before translating
-MAX_BUFFER_CHARS = 2000  # characters - max size before translating
-SILENCE_FLUSH_TIME = 5  # seconds - flush after this much silence
-
-@dataclass
-class TranscriptionSegment:
-    text: str
-    speaker: str
-    start_time: float
-    end_time: float
+from config_loader import get_config
+from diarization_factory import create_diarizer
 
 
 class WhisperTranscriber:
     """Handles whisper.cpp transcription"""
-    
-    def __init__(self, model_name: str = WHISPER_MODEL):
+
+    def __init__(self, model_name: str):
         self.model_name = model_name
         self.whisper_path = None
         self.model_path = None
-        
+
     def setup(self):
-        """Find whisper.cpp executable and model"""
-        # Check if whisper.cpp is available
         whisper_locations = [
             str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"),
             "/usr/local/bin/whisper-cli",
             str(Path.home() / "whisper.cpp" / "build" / "bin" / "main"),
-            "/usr/local/bin/whisper-cpp",
             str(Path.home() / "whisper.cpp" / "main"),
+            "/usr/local/bin/whisper-cpp",
             "./whisper.cpp/main",
-            "whisper-cpp"
+            "whisper-cpp",
         ]
-        
+
         for location in whisper_locations:
             if Path(location).exists() or self._command_exists(location):
                 self.whisper_path = location
                 break
-        
+
         if not self.whisper_path:
             raise RuntimeError(
                 "whisper.cpp not found. Please install it first.\n"
                 "See setup instructions in the README."
             )
-        
-        # Find model file
+
         model_locations = [
             f"/usr/local/share/whisper/ggml-{self.model_name}.bin",
             str(Path.home() / "whisper.cpp" / "models" / f"ggml-{self.model_name}.bin"),
-            f"./models/ggml-{self.model_name}.bin"
+            f"./models/ggml-{self.model_name}.bin",
         ]
-        
+
         for location in model_locations:
             if Path(location).exists():
                 self.model_path = location
                 break
-        
+
         if not self.model_path:
             raise RuntimeError(
                 f"Whisper model '{self.model_name}' not found.\n"
                 "Run the download script first."
             )
-        
+
         print(f"[OK] Whisper.cpp found at: {self.whisper_path}")
         print(f"[OK] Model found at: {self.model_path}")
-    
-    def _command_exists(self, cmd):
-        """Check if command exists in PATH"""
+
+    def _command_exists(self, cmd: str) -> bool:
         try:
             subprocess.run([cmd, "--help"], capture_output=True, timeout=1)
             return True
-        except:
+        except Exception:
             return False
-    
+
     def transcribe(self, audio_file: str) -> str:
-        """Transcribe audio file using whisper.cpp"""
         try:
-            # Run whisper.cpp
             cmd = [
                 self.whisper_path,
                 "-m", self.model_path,
                 "-f", audio_file,
-                "-l", "cs",  # Czech language
-                "-nt",  # No timestamps in output
-                "-np",  # No progress
+                "-l", "cs",
+                "-nt",
+                "-np",
             ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
             if result.returncode != 0:
                 print(f"Whisper error: {result.stderr}")
                 return ""
-            
-            # Extract transcription from output
-            # whisper.cpp outputs to stderr by default
-            output = result.stderr if result.stderr else result.stdout
-            
-            # Parse output (format: "[timestamp] text")
+
+            # Transcription goes to stdout; stderr contains diagnostic messages
+            output = result.stdout if result.stdout.strip() else result.stderr
+
             lines = output.strip().split('\n')
-            transcription = []
-            for line in lines:
-                if line.strip() and not line.startswith('['):
-                    transcription.append(line.strip())
-            
+            transcription = [
+                line.strip()
+                for line in lines
+                if line.strip() and not line.startswith('[')
+            ]
+
             return ' '.join(transcription)
-            
+
         except subprocess.TimeoutExpired:
             print("Whisper transcription timed out")
             return ""
@@ -195,141 +133,49 @@ class WhisperTranscriber:
             return ""
 
 
-class SpeakerDiarizer:
-    """Handles speaker diarization with pyannote"""
-    
-    def __init__(self):
-        self.pipeline = None
-        
-    def setup(self):
-        """Initialize pyannote pipeline"""
-        if not ENABLE_DIARIZATION:
-            print("[WARN] Speaker diarization disabled (SPEED profile)")
-            self.pipeline = None
-            return
-            
-        try:
-            # Load pretrained pipeline
-            # Requires HuggingFace token set in environment or passed here
-            import os
-            hf_token = os.environ.get('HF_TOKEN')
-            
-            if not hf_token:
-                print("[WARN] HF_TOKEN not set - skipping speaker diarization")
-                self.pipeline = None
-                return
-            
-            print("⏳ Loading speaker diarization (this takes ~30s first time)...")
-            
-            # Try new API first (token), fall back to old API (use_auth_token)
-            try:
-                self.pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    token=hf_token
-                )
-            except TypeError:
-                # Old API version
-                self.pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token
-                )
-            
-            print("[OK] Pyannote diarization pipeline loaded")
-            
-        except Exception as e:
-            print(f"[WARN] Pyannote setup failed: {e}")
-            print("  Continuing without speaker diarization...")
-            self.pipeline = None
-    
-    def diarize(self, audio_file: str) -> List[tuple]:
-        """
-        Perform speaker diarization
-        Returns: List of (start, end, speaker_label) tuples
-        """
-        if not self.pipeline:
-            return []
-        
-        try:
-            # Run diarization
-            diarization = self.pipeline(audio_file)
-            
-            # Extract speaker segments
-            segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                segments.append((turn.start, turn.end, speaker))
-            
-            return segments
-            
-        except Exception as e:
-            print(f"Diarization error: {e}")
-            return []
-
-
 class VoiceActivityDetector:
     """Silero VAD for detecting speech in audio"""
-    
-    def __init__(self, threshold: float = VAD_THRESHOLD):
+
+    def __init__(self, threshold: float, sample_rate: int):
         self.model = None
         self.threshold = threshold
-        self.utils = None
-        
+        self.sample_rate = sample_rate
+
     def setup(self):
-        """Load Silero VAD model"""
         try:
-            # Load Silero VAD model from torch hub
-            self.model, self.utils = torch.hub.load(
+            self.model, _ = torch.hub.load(
                 repo_or_dir='snakers4/silero-vad',
                 model='silero_vad',
                 force_reload=False,
-                onnx=False
+                onnx=False,
             )
             print("[OK] Silero VAD loaded")
         except Exception as e:
             print(f"[WARN] VAD setup failed: {e}")
             print("  Continuing without VAD (may have more false positives)...")
             self.model = None
-    
+
     def contains_speech(self, audio_data: np.ndarray) -> bool:
-        """
-        Check if audio chunk contains speech
-        Returns: True if speech detected, False otherwise
-        """
         if self.model is None:
-            return True  # If VAD not available, process everything
-        
+            return True
+
         try:
-            # Convert to float32 and normalize to [-1, 1]
             audio_float = audio_data.astype(np.float32) / 32768.0
-            
-            # Silero VAD needs 512 samples at 16kHz (32ms windows)
             window_size = 512
             speech_probs = []
-            
-            # Process audio in 512-sample windows
+
             for i in range(0, len(audio_float), window_size):
                 window = audio_float[i:i + window_size]
-                
-                # Skip incomplete windows at the end
                 if len(window) < window_size:
                     break
-                
-                # Convert to torch tensor
-                audio_tensor = torch.from_numpy(window)
-                
-                # Get speech probability for this window
-                speech_prob = self.model(audio_tensor, SAMPLE_RATE).item()
+                speech_prob = self.model(torch.from_numpy(window), self.sample_rate).item()
                 speech_probs.append(speech_prob)
-            
-            # Return True if any window has speech above threshold
-            if speech_probs:
-                max_prob = max(speech_probs)
-                return max_prob > self.threshold
-            
-            return False
-            
+
+            return max(speech_probs) > self.threshold if speech_probs else False
+
         except Exception as e:
             print(f"VAD error: {e}")
-            return True  # On error, process the chunk
+            return True
 
 
 @dataclass
@@ -339,391 +185,288 @@ class SpeakerBuffer:
     text_chunks: List[str]
     start_time: float
     last_update: float
-    
+    max_time: float
+    max_chars: int
+    silence_flush: float
+
     def add_chunk(self, text: str):
-        """Add a text chunk to the buffer"""
         self.text_chunks.append(text)
         self.last_update = time.time()
-    
+
     def get_full_text(self) -> str:
-        """Get concatenated text from all chunks"""
         return " ".join(self.text_chunks)
-    
+
     def get_char_count(self) -> int:
-        """Get total character count"""
         return len(self.get_full_text())
-    
+
     def get_duration(self) -> float:
-        """Get time since buffer started"""
         return time.time() - self.start_time
-    
+
     def get_idle_time(self) -> float:
-        """Get time since last update"""
         return time.time() - self.last_update
-    
+
     def should_flush(self) -> bool:
-        """Check if buffer should be flushed based on time/size limits"""
         return (
-            self.get_duration() >= MAX_BUFFER_TIME or
-            self.get_char_count() >= MAX_BUFFER_CHARS or
-            self.get_idle_time() >= SILENCE_FLUSH_TIME
+            self.get_duration() >= self.max_time
+            or self.get_char_count() >= self.max_chars
+            or self.get_idle_time() >= self.silence_flush
         )
 
 
 class AudioProcessor:
     """Main audio processing pipeline"""
-    
-    def __init__(self):
-        self.transcriber = WhisperTranscriber()
-        self.diarizer = SpeakerDiarizer()
-        self.vad = VoiceActivityDetector()
-        self.audio_queue = Queue()
+
+    def __init__(self, config: Dict[str, Any]):
+        self.sample_rate = config['audio']['sample_rate']
+        self.channels = config['audio']['channels']
+        self.chunk_duration = config['transcription']['chunk_duration']
+        self.websocket_url = config['api']['websocket_url']
+        self.buffer_config = config['buffering']
+
+        self.transcriber = WhisperTranscriber(model_name=config['transcription']['model'])
+        self.diarizer = create_diarizer(
+            method=config['diarization']['method'],
+            config=config['diarization'],
+        )
+        self.vad = VoiceActivityDetector(
+            threshold=config['vad']['threshold'],
+            sample_rate=self.sample_rate,
+        )
+
+        self.audio_queue: Queue = Queue()
         self.running = False
         self.websocket = None
         self.current_buffer: Optional[SpeakerBuffer] = None
-        self.no_speech_time = 0.0
         self.last_speech_time = time.time()
-        
+
     async def setup(self):
-        """Initialize all components"""
         print("Setting up audio processing pipeline...")
         self.transcriber.setup()
         self.vad.setup()
         self.diarizer.setup()
         print("[OK] Pipeline ready\n")
-    
-    def save_audio_chunk(self, audio_data: np.ndarray) -> str:
-        """Save audio chunk to temporary WAV file"""
-        temp_file = tempfile.NamedTemporaryFile(
-            suffix='.wav',
-            delete=False
+
+    def _new_buffer(self, speaker: Optional[str]) -> SpeakerBuffer:
+        now = time.time()
+        return SpeakerBuffer(
+            speaker=speaker,
+            text_chunks=[],
+            start_time=now,
+            last_update=now,
+            max_time=self.buffer_config['max_time'],
+            max_chars=self.buffer_config['max_chars'],
+            silence_flush=self.buffer_config['silence_flush'],
         )
-        
+
+    def save_audio_chunk(self, audio_data: np.ndarray) -> str:
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         with wave.open(temp_file.name, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(SAMPLE_RATE)
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
             wf.writeframes(audio_data.tobytes())
-        
         return temp_file.name
-    
-    def assign_speakers_to_text(
-        self, 
-        text: str, 
-        audio_duration: float,
-        diarization_segments: List[tuple]
-    ) -> str:
-        """
-        Assign speaker to transcribed text based on diarization
-        Simple heuristic: use speaker who spoke most during this chunk
-        """
+
+    def assign_speaker(self, diarization_segments: List[tuple]) -> Optional[str]:
         if not diarization_segments:
             return None
-        
-        # Count duration per speaker
-        speaker_durations = {}
+        speaker_durations: Dict[str, float] = {}
         for start, end, speaker in diarization_segments:
-            duration = end - start
-            speaker_durations[speaker] = speaker_durations.get(speaker, 0) + duration
-        
-        # Return speaker with most time
-        if speaker_durations:
-            return max(speaker_durations.items(), key=lambda x: x[1])[0]
-        
-        return None
-    
+            speaker_durations[speaker] = speaker_durations.get(speaker, 0) + (end - start)
+        return max(speaker_durations, key=speaker_durations.get)
+
     async def flush_buffer(self, reason: str = ""):
-        """Flush current buffer and send for translation"""
         if not self.current_buffer or not self.current_buffer.text_chunks:
             return
-        
+
         full_text = self.current_buffer.get_full_text()
         speaker = self.current_buffer.speaker
-        duration = self.current_buffer.get_duration()
-        
-        print(f"\n[FLUSH] Flushing buffer: {len(self.current_buffer.text_chunks)} chunks, "
-              f"{self.current_buffer.get_char_count()} chars, {duration:.1f}s"
-              f"{' (' + reason + ')' if reason else ''}")
-        
-        # Send to translation
+
+        print(
+            f"\n[FLUSH] {len(self.current_buffer.text_chunks)} chunks, "
+            f"{self.current_buffer.get_char_count()} chars"
+            f"{' (' + reason + ')' if reason else ''}"
+        )
+
         await self.send_for_translation(full_text, speaker)
-        
-        # Print to console
+
         speaker_label = f"[{speaker}] " if speaker else ""
         print(f"{speaker_label}Czech: {full_text}")
-        
-        # Clear buffer
+
         self.current_buffer = None
-    
-    def should_create_new_buffer(self, speaker: Optional[str]) -> bool:
-        """Check if we should start a new buffer"""
-        if not self.current_buffer:
-            return True
-        
-        # Speaker changed - this is the main trigger
-        if speaker != self.current_buffer.speaker:
-            return True
-        
-        # Don't check buffer limits here - they're checked separately
-        return False
-    
-    async def process_audio_chunk(self, audio_data: np.ndarray, duration: float):
-        """Process a chunk of audio through the pipeline"""
+
+    async def process_audio_chunk(self, audio_data: np.ndarray):
         start_time = time.time()
-        
-        # Check for speech using VAD
-        vad_start = time.time()
+
         has_speech = self.vad.contains_speech(audio_data)
-        vad_time = time.time() - vad_start
-        
+
         if not has_speech:
-            print(".", end="", flush=True)  # Show activity without speech
-            
-            # Track silence time
-            self.no_speech_time = time.time() - self.last_speech_time
-            
-            # Flush buffer if we've had enough silence
-            if self.no_speech_time >= SILENCE_FLUSH_TIME:
+            print(".", end="", flush=True)
+            if time.time() - self.last_speech_time >= self.buffer_config['silence_flush']:
                 await self.flush_buffer(reason="silence timeout")
-                self.no_speech_time = 0
-            
             return
-        
-        # Reset silence tracking
+
         self.last_speech_time = time.time()
-        self.no_speech_time = 0
-        
-        print(f"\n[PROC] Processing chunk ({duration}s audio, VAD: {vad_time*1000:.0f}ms)...", end="", flush=True)
-        
-        # Save audio to temp file
+        print(f"\n[PROC] Processing {self.chunk_duration}s chunk...", end="", flush=True)
+
         audio_file = self.save_audio_chunk(audio_data)
-        
+
         try:
-            # Run transcription and diarization in parallel
-            transcription_start = time.time()
-            transcription_task = asyncio.to_thread(
-                self.transcriber.transcribe, audio_file
-            )
-            diarization_task = asyncio.to_thread(
-                self.diarizer.diarize, audio_file
-            )
-            
-            # Wait for both to complete
             czech_text, diarization = await asyncio.gather(
-                transcription_task,
-                diarization_task
+                asyncio.to_thread(self.transcriber.transcribe, audio_file),
+                asyncio.to_thread(self.diarizer.diarize, audio_file),
             )
-            transcription_time = time.time() - transcription_start
-            
+
             if not czech_text.strip():
                 print(" [no speech detected]")
                 return
-            
-            # Assign speaker
-            speaker = self.assign_speakers_to_text(
-                czech_text, duration, diarization
-            )
-            
-            # Calculate total processing time
-            total_time = time.time() - start_time
-            rtf = total_time / duration  # Real-time factor
-            
-            print(f" [OK] {transcription_time:.1f}s (RTF: {rtf:.2f}x)")
-            print(f"  + Chunk: \"{czech_text[:60]}{'...' if len(czech_text) > 60 else ''}\"")
-            
-            # Send transcription to UI immediately (real-time display)
+
+            speaker = self.assign_speaker(diarization)
+            rtf = (time.time() - start_time) / self.chunk_duration
+
+            print(f" [OK] RTF: {rtf:.2f}x")
+            print(f"  + \"{czech_text[:60]}{'...' if len(czech_text) > 60 else ''}\"")
+
             await self.send_transcription_only(czech_text, speaker)
-            
-            # Check if we need to start new buffer due to speaker change
-            if self.should_create_new_buffer(speaker):
-                # Flush existing buffer first
+
+            if not self.current_buffer or speaker != self.current_buffer.speaker:
                 if self.current_buffer:
                     await self.flush_buffer(reason="speaker change")
-                
-                # Start new buffer
-                self.current_buffer = SpeakerBuffer(
-                    speaker=speaker,
-                    text_chunks=[],
-                    start_time=time.time(),
-                    last_update=time.time()
-                )
-                print(f"  -> New buffer started for {speaker or 'unknown speaker'}")
-            
-            # Add chunk to current buffer
+                self.current_buffer = self._new_buffer(speaker)
+                print(f"  -> Buffer started for {speaker or 'unknown speaker'}")
+
             self.current_buffer.add_chunk(czech_text)
-            print(f"  -> Buffer: {self.current_buffer.get_char_count()} chars, "
-                  f"{len(self.current_buffer.text_chunks)} chunks, "
-                  f"{self.current_buffer.get_duration():.1f}s")
-            
-            # Check if buffer should be flushed due to time/size limits
+            print(
+                f"  -> Buffer: {self.current_buffer.get_char_count()} chars, "
+                f"{len(self.current_buffer.text_chunks)} chunks"
+            )
+
             if self.current_buffer.should_flush():
-                reason = []
-                if self.current_buffer.get_duration() >= MAX_BUFFER_TIME:
-                    reason.append(f"time limit {MAX_BUFFER_TIME}s")
-                if self.current_buffer.get_char_count() >= MAX_BUFFER_CHARS:
-                    reason.append(f"char limit {MAX_BUFFER_CHARS}")
-                if self.current_buffer.get_idle_time() >= SILENCE_FLUSH_TIME:
-                    reason.append(f"silence {SILENCE_FLUSH_TIME}s")
-                
-                await self.flush_buffer(reason=" | ".join(reason))
-            
+                reasons = []
+                if self.current_buffer.get_duration() >= self.buffer_config['max_time']:
+                    reasons.append("time limit")
+                if self.current_buffer.get_char_count() >= self.buffer_config['max_chars']:
+                    reasons.append("char limit")
+                if self.current_buffer.get_idle_time() >= self.buffer_config['silence_flush']:
+                    reasons.append("silence")
+                await self.flush_buffer(reason=" | ".join(reasons))
+
         finally:
-            # Cleanup temp file
             Path(audio_file).unlink(missing_ok=True)
-    
+
     async def send_for_translation(self, czech_text: str, speaker: Optional[str]):
-        """Send transcription to translation service via WebSocket"""
         if not self.websocket:
             return
-        
         try:
-            message = {
+            await self.websocket.send(json.dumps({
                 "type": "translate",
                 "czech_text": czech_text,
-                "speaker": speaker
-            }
-            await self.websocket.send(json.dumps(message))
+                "speaker": speaker,
+            }))
         except Exception as e:
-            print(f"\n[WARN] WebSocket error: {e}")
-            # Try to reconnect
-            try:
-                await self.websocket.close()
-            except:
-                pass
+            print(f"\n[WARN] WebSocket send error: {e}")
             self.websocket = None
-            print("  Attempting to reconnect...")
             await self.connect_websocket()
-    
+
     async def send_transcription_only(self, czech_text: str, speaker: Optional[str]):
-        """Send Czech transcription to UI immediately (no translation yet)"""
         if not self.websocket:
             return
-        
         try:
-            message = {
+            await self.websocket.send(json.dumps({
                 "type": "transcription",
                 "czech_text": czech_text,
-                "speaker": speaker
-            }
-            await self.websocket.send(json.dumps(message))
+                "speaker": speaker,
+            }))
         except Exception as e:
-            print(f"\n[WARN] WebSocket error sending transcription: {e}")
-    
+            print(f"\n[WARN] WebSocket send error: {e}")
+
     async def connect_websocket(self):
-        """Connect to translation service with retry"""
-        max_retries = 3
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                self.websocket = await websockets.connect(WEBSOCKET_URL)
-                print(f"[OK] Connected to translation service at {WEBSOCKET_URL}")
+                self.websocket = await websockets.connect(self.websocket_url)
+                print(f"[OK] Connected to translation service at {self.websocket_url}")
                 return
             except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"[WARN] Connection attempt {attempt + 1} failed, retrying in {retry_delay}s...")
-                    await asyncio.sleep(retry_delay)
+                if attempt < 2:
+                    print(f"[WARN] Connection attempt {attempt + 1} failed, retrying in 2s...")
+                    await asyncio.sleep(2)
                 else:
-                    print(f"[WARN] Could not connect to translation service after {max_retries} attempts")
-                    print(f"  Error: {e}")
+                    print(f"[WARN] Could not connect to translation service: {e}")
                     print("  Continuing without live translation...")
                     self.websocket = None
-    
+
     def capture_audio_thread(self):
-        """Capture audio from microphone in separate thread"""
         p = pyaudio.PyAudio()
-        
         stream = p.open(
             format=pyaudio.paInt16,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
+            channels=self.channels,
+            rate=self.sample_rate,
             input=True,
-            frames_per_buffer=1024
+            frames_per_buffer=1024,
         )
-        
+
         print(f"\n[REC] Recording audio (Ctrl+C to stop)...")
-        print(f"   Processing in {CHUNK_DURATION}s chunks\n")
-        
-        chunk_samples = SAMPLE_RATE * CHUNK_DURATION
-        buffer = []
-        
+        print(f"   Processing in {self.chunk_duration}s chunks\n")
+
+        chunk_samples = self.sample_rate * self.chunk_duration
+        buffer: List[int] = []
+
         try:
             while self.running:
                 data = stream.read(1024, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                buffer.extend(audio_data)
-                
-                # When we have enough samples, queue for processing
+                buffer.extend(np.frombuffer(data, dtype=np.int16))
+
                 if len(buffer) >= chunk_samples:
-                    chunk = np.array(buffer[:chunk_samples])
-                    self.audio_queue.put(chunk)
+                    self.audio_queue.put(np.array(buffer[:chunk_samples]))
                     buffer = buffer[chunk_samples:]
-        
         finally:
             stream.stop_stream()
             stream.close()
             p.terminate()
-    
+
     async def process_queue(self):
-        """Process queued audio chunks"""
         while self.running:
-            try:
-                # Check for new audio chunks
-                if not self.audio_queue.empty():
-                    audio_chunk = self.audio_queue.get()
-                    await self.process_audio_chunk(audio_chunk, CHUNK_DURATION)
-                else:
-                    await asyncio.sleep(0.1)
-            except Exception as e:
-                print(f"Processing error: {e}")
-    
+            if not self.audio_queue.empty():
+                await self.process_audio_chunk(self.audio_queue.get())
+            else:
+                await asyncio.sleep(0.1)
+
     async def run(self):
-        """Main processing loop"""
         await self.setup()
         await self.connect_websocket()
-        
+
         self.running = True
-        
-        # Start audio capture in separate thread
-        capture_thread = threading.Thread(
-            target=self.capture_audio_thread,
-            daemon=True
-        )
+
+        capture_thread = threading.Thread(target=self.capture_audio_thread, daemon=True)
         capture_thread.start()
-        
+
         try:
-            # Process audio queue
             await self.process_queue()
         except KeyboardInterrupt:
             print("\n\n[STOP] Stopping...")
         finally:
             self.running = False
-            
-            # Flush any remaining buffer
             if self.current_buffer:
                 print("\n[FLUSH] Flushing final buffer...")
                 await self.flush_buffer(reason="shutdown")
-            
             if self.websocket:
                 await self.websocket.close()
 
 
 async def main():
+    config = get_config()
+
     print("=" * 60)
     print("Polyglot - Real-Time Speech Translation")
     print("=" * 60)
     print()
-    print(f"Active Profile: {CONFIG['name']}")
-    print(f"  • Model: {WHISPER_MODEL}")
-    print(f"  • Chunk duration: {CHUNK_DURATION}s")
-    print(f"  • Speaker diarization: {'Enabled' if ENABLE_DIARIZATION else 'Disabled'}")
-    print(f"  • {CONFIG['description']}")
+    print(f"  Model:        {config['transcription']['model']}")
+    print(f"  Chunk:        {config['transcription']['chunk_duration']}s")
+    print(f"  Diarization:  {config['diarization']['method']}")
+    print(f"  VAD:          {config['vad']['threshold']}")
     print()
-    print("To switch profiles, edit ACTIVE_PROFILE in audio_pipeline.py")
-    print("=" * 60)
-    print()
-    
-    processor = AudioProcessor()
+
+    processor = AudioProcessor(config)
     await processor.run()
 
 
